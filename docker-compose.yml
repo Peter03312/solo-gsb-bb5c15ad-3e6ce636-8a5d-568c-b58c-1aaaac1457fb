@@ -1,0 +1,15 @@
+services:
+  api:
+    build: .
+    container_name: msg-parser-api
+    ports:
+      - "8000:8000"
+    environment:
+      # SQLite file location inside the container (persisted via volume)
+      DB_PATH: /data/parser.db
+    volumes:
+      - parser-data:/data
+    restart: unless-stopped
+
+volumes:
+  parser-data:
