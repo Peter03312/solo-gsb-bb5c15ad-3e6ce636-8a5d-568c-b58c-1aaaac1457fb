@@ -7,6 +7,12 @@ services:
     environment:
       # SQLite file location inside the container (persisted via volume)
       DB_PATH: /data/parser.db
+      # Secret key for POST /api/v1/messages/redact (HMAC-SHA256 masking).
+      # Same key + same input always produces the same redacted output.
+      # Override with a REDACTION_KEY from your shell / .env file for real
+      # deployments; the fallback below only keeps `docker compose up`
+      # working as a one-command demo.
+      REDACTION_KEY: ${REDACTION_KEY:-change-me-redaction-secret}
     volumes:
       - parser-data:/data
     restart: unless-stopped

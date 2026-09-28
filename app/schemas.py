@@ -180,6 +180,17 @@ class MessageProfileRequest(BaseModel):
     samples: List[MessageProfileSample] = Field(min_length=1, max_length=500)
 
 
+class RedactRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    device_type: str = Field(min_length=1, max_length=128)
+    version: Optional[str] = None  # omitted -> latest active version
+    hex: str = Field(min_length=2)
+    # names of the fields to mask; only uint/int fields are eligible and each
+    # name must be present on the message's active branch.
+    fields: List[str] = Field(min_length=1)
+
+
 def validate_definition(defn: DefinitionCreate) -> None:
     """Cross-field semantic validation. Raises ValueError on problems."""
     if not defn.fields:

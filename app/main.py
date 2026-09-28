@@ -1,5 +1,6 @@
 """Industrial binary message parsing API."""
 
+import os
 import re
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -24,6 +25,7 @@ from .framing import (
 )
 from .parser import ParseError, parse_message
 from .profiler import VersionProfile
+from .redactor import RedactionError, redact_message
 from .schemas import (
     CompatibilityRequest,
     DefinitionCreate,
@@ -33,6 +35,7 @@ from .schemas import (
     FixtureRunRequest,
     MessageProfileRequest,
     ParseRequest,
+    RedactRequest,
     StreamParseRequest,
     validate_definition,
 )
@@ -770,7 +773,77 @@ def encode(req: EncodeRequest):
     }
 
 
-# ------------------------------------------------------------ fixtures (回归) --
+@app.post("/api/v1/messages/redact")
+def redact(req: RedactRequest):
+    """Deterministically mask selected ``uint``/``int`` fields of a message.
+
+    The input must fully match the selected definition (complete consumption
+    and a valid checksum); only then are the chosen field occurrences replaced
+    in place by an HMAC-SHA256 bit stream truncated to the field bit width,
+    keyed by the ``REDACTION_KEY`` environment variable. The HMAC input binds
+    the field name, the repeat element index (``null`` for scalar fields) and
+    the original raw value, so the same key and input always yield the same
+    replacement while the branch layout and the total message length stay
+    unchanged. Conditionally-referenced fields, repeat counter fields and the
+    checksum field cannot be redacted; unknown fields and fields absent from
+    the active branch return 422. The checksum is recomputed over the redacted
+    bytes, so the returned hex parses again with a valid checksum.
+    """
+    key = os.environ.get("REDACTION_KEY", "")
+    if not key:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "redaction is not configured: set the REDACTION_KEY environment "
+                "variable to a secret key and restart the service"
+            ),
+        )
+
+    record = _select_definition(req.device_type, req.version)
+    data = _decode_hex(req.hex)
+
+    # Gate on the exact same acceptance rule as /detect: the definition must
+    # fully consume the message and the original checksum must be valid.
+    _result, rejection = _match_definition(record, data, unit="message")
+    if rejection is not None:
+        _kind, detail = rejection
+        raise HTTPException(status_code=422, detail=detail)
+
+    try:
+        outcome = redact_message(
+            record["fields"],
+            record["checksum"],
+            data,
+            req.fields,
+            key.encode("utf-8"),
+        )
+    except RedactionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    # The redacted bytes must parse back with the same layout and a valid
+    # checksum; anything else is an internal redactor failure.
+    verify = parse_message(record["fields"], record["checksum"], bytes.fromhex(outcome["hex"]))
+    if verify["trailing_bits"] or (
+        record["checksum"]
+        and (verify["checksum"] is None or not verify["checksum"]["valid"])
+    ):
+        raise HTTPException(
+            status_code=500,
+            detail="redacted message failed verification against the definition",
+        )
+
+    return {
+        "device_type": record["device_type"],
+        "version": record["version"],
+        "definition_active": record["active"],
+        "hex": outcome["hex"],
+        "redactions": outcome["redactions"],
+        "checksum": outcome["checksum"],
+        "message_bits": len(data) * 8,
+        "consumed_bits": verify["consumed_bits"],
+        "trailing_bits": verify["trailing_bits"],
+        "warnings": verify["warnings"],
+    }
 
 
 @app.post("/api/v1/fixtures", status_code=201)

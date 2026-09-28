@@ -3312,3 +3312,331 @@ def test_parse_ts_accepts_z_and_naive_as_utc():
     assert parse_ts("2030-01-01T00:00:00", "start") == datetime(
         2030, 1, 1, tzinfo=timezone.utc
     )
+
+
+# ---------------------------------------------------------------- redaction --
+
+REDACT_KEY = "unit-test-redaction-key"
+
+
+def test_redact_scalar_fields_deterministic_and_reparseable(monkeypatch):
+    monkeypatch.setenv("REDACTION_KEY", REDACT_KEY)
+    body = bytes([0xAA, 0x10, 0xEB, 0x00])  # temperature branch, raw 235 (LE)
+    hex_in = make_message(body)
+
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={
+            "device_type": "temp_sensor",
+            "version": "1.0.0",
+            "hex": hex_in,
+            "fields": ["temperature", "flags"],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    # length and branch preserved
+    assert len(data["hex"]) == len(hex_in)
+    assert data["message_bits"] == 48
+    assert data["consumed_bits"] == 48
+    assert data["trailing_bits"] == 0
+
+    by_name = {r["name"]: r for r in data["redactions"]}
+    assert by_name["temperature"]["index"] is None
+    assert by_name["temperature"]["original_raw"] == 235
+    assert by_name["temperature"]["bit_offset"] == 16
+    assert by_name["flags"]["index"] is None
+
+    # deterministic: same key + same input -> same output
+    resp2 = client.post(
+        "/api/v1/messages/redact",
+        json={
+            "device_type": "temp_sensor",
+            "version": "1.0.0",
+            "hex": hex_in,
+            "fields": ["temperature", "flags"],
+        },
+    )
+    assert resp2.json()["hex"] == data["hex"]
+
+    # the redacted hex parses again, checksum valid, branch unchanged
+    reparsed = client.post(
+        "/api/v1/parse",
+        json={"device_type": "temp_sensor", "version": "1.0.0", "hex": data["hex"]},
+    ).json()
+    assert reparsed["checksum"]["valid"] is True
+    assert reparsed["trailing_bits"] == 0
+    fields = {f["name"]: f for f in reparsed["fields"]}
+    assert fields["header"]["value"] == 0xAA
+    assert fields["msg_type"]["value"] == 1  # branch control field untouched
+    assert fields["temperature"]["raw_value"] == by_name["temperature"]["redacted_raw"]
+
+    # HMAC-SHA256 stream truncated to the field width, canonical NUL-joined input
+    import hashlib
+    import hmac as hmac_mod
+
+    digest = hmac_mod.new(
+        REDACT_KEY.encode(), b"temperature\x00235", hashlib.sha256
+    ).digest()
+    expected = int.from_bytes(digest, "big") >> (256 - 16)
+    expected -= 1 << 16 if expected >= 1 << 15 else 0
+    assert by_name["temperature"]["redacted_raw"] == expected
+    # response carries the recomputed checksum (valid by construction; the
+    # reparse above asserts checksum.valid on the redacted hex)
+    assert data["checksum"]["algorithm"] == "crc16-ccitt"
+
+    # a different key yields a different mask
+    monkeypatch.setenv("REDACTION_KEY", "a-totally-different-key")
+    resp3 = client.post(
+        "/api/v1/messages/redact",
+        json={
+            "device_type": "temp_sensor",
+            "version": "1.0.0",
+            "hex": hex_in,
+            "fields": ["temperature"],
+        },
+    )
+    assert resp3.json()["hex"] != data["hex"]
+
+
+def test_redact_repeated_field_masks_every_index(monkeypatch):
+    monkeypatch.setenv("REDACTION_KEY", REDACT_KEY)
+    samples = [23.2, 200.0, 1000.0]  # raws 232, 2000, 10000
+    hex_in = _repeat_hex(samples)
+
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={
+            "device_type": "array_dev",
+            "version": "1.0.0",
+            "hex": hex_in,
+            "fields": ["samples"],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    assert len(data["hex"]) == len(hex_in)
+    raws_red = [r["redacted_raw"] for r in data["redactions"]]
+    indices = [r["index"] for r in data["redactions"]]
+    assert indices == [0, 1, 2]
+    assert [r["original_raw"] for r in data["redactions"]] == [232, 2000, 10000]
+    # redaction actually changes the values
+    assert raws_red != [232, 2000, 10000]
+
+    # counter untouched, reparse valid
+    reparsed = client.post(
+        "/api/v1/parse",
+        json={"device_type": "array_dev", "version": "1.0.0", "hex": data["hex"]},
+    ).json()
+    assert reparsed["checksum"]["valid"] is True
+    fields = {f["name"]: f for f in reparsed["fields"]}
+    assert fields["count"]["value"] == 3
+    assert fields["samples"]["raw_value"] == raws_red
+
+    # per-index canonical HMAC input
+    import hashlib
+    import hmac as hmac_mod
+
+    for i, original in enumerate([232, 2000, 10000]):
+        digest = hmac_mod.new(
+            REDACT_KEY.encode(),
+            f"samples\x00{i}\x00{original}".encode(),
+            hashlib.sha256,
+        ).digest()
+        expected = int.from_bytes(digest, "big") >> (256 - 16)
+        assert raws_red[i] == expected
+
+
+def test_redact_rejects_protected_and_unknown_fields(monkeypatch):
+    monkeypatch.setenv("REDACTION_KEY", REDACT_KEY)
+    body = bytes([0xAA, 0x10, 0xEB, 0x00])
+    hex_in = make_message(body)
+
+    def redact(field_names):
+        return client.post(
+            "/api/v1/messages/redact",
+            json={
+                "device_type": "temp_sensor",
+                "version": "1.0.0",
+                "hex": hex_in,
+                "fields": field_names,
+            },
+        )
+
+    # condition source field
+    resp = redact(["msg_type"])
+    assert resp.status_code == 422
+    assert "condition" in resp.json()["detail"]
+
+    # checksum field
+    resp = redact(["crc"])
+    assert resp.status_code == 422
+    assert "checksum" in resp.json()["detail"]
+
+    # unknown field
+    resp = redact(["ghost"])
+    assert resp.status_code == 422
+    assert "unknown field" in resp.json()["detail"]
+
+    # field absent from the active branch (humidity skipped, msg_type == 1)
+    resp = redact(["humidity"])
+    assert resp.status_code == 422
+    assert "not present" in resp.json()["detail"]
+
+    # duplicate selection
+    resp = redact(["flags", "flags"])
+    assert resp.status_code == 422
+    assert "more than once" in resp.json()["detail"]
+
+    # non numeric type: register a bool field definition
+    client.post(
+        "/api/v1/definitions",
+        json={
+            "device_type": "redact_bool_dev",
+            "version": "1.0.0",
+            "fields": [
+                {"name": "flag", "type": "bool", "bit_length": 1},
+                {"name": "pad", "type": "uint", "bit_length": 7},
+            ],
+        },
+    )
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={
+            "device_type": "redact_bool_dev",
+            "version": "1.0.0",
+            "hex": "80",
+            "fields": ["flag"],
+        },
+    )
+    assert resp.status_code == 422
+    assert "only uint/int" in resp.json()["detail"]
+
+
+def test_redact_repeat_counter_and_input_gate(monkeypatch):
+    monkeypatch.setenv("REDACTION_KEY", REDACT_KEY)
+    hex_in = _repeat_hex([23.2, 200.0])
+
+    # repeat counter cannot be redacted
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={
+            "device_type": "array_dev",
+            "version": "1.0.0",
+            "hex": hex_in,
+            "fields": ["count"],
+        },
+    )
+    assert resp.status_code == 422
+    assert "repeat count" in resp.json()["detail"]
+
+    # invalid original checksum -> 422 (input must fully match)
+    bad = bytearray(bytes.fromhex(hex_in))
+    bad[-1] ^= 0xFF
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={
+            "device_type": "array_dev",
+            "version": "1.0.0",
+            "hex": bad.hex(),
+            "fields": ["header"],
+        },
+    )
+    assert resp.status_code == 422
+    assert "checksum mismatch" in resp.json()["detail"]
+
+    # trailing bits -> 422
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={
+            "device_type": "array_dev",
+            "version": "1.0.0",
+            "hex": hex_in + "ff",
+            "fields": ["header"],
+        },
+    )
+    assert resp.status_code == 422
+    assert "trailing bit" in resp.json()["detail"]
+
+    # malformed hex -> 422
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={
+            "device_type": "array_dev",
+            "version": "1.0.0",
+            "hex": "zz",
+            "fields": ["header"],
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_redact_unknown_device_version_and_body_validation(monkeypatch):
+    monkeypatch.setenv("REDACTION_KEY", REDACT_KEY)
+    # unknown explicit version -> 404 (definition selection reused as-is)
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={
+            "device_type": "temp_sensor",
+            "version": "9.9.9",
+            "hex": "aa10eb008936",
+            "fields": ["flags"],
+        },
+    )
+    assert resp.status_code == 404
+
+    # empty field list -> 422; extra body keys -> 422
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={
+            "device_type": "temp_sensor",
+            "version": "1.0.0",
+            "hex": "aa10eb008936",
+            "fields": [],
+        },
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={
+            "device_type": "temp_sensor",
+            "version": "1.0.0",
+            "hex": "aa10eb008936",
+            "fields": ["flags"],
+            "unexpected": 1,
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_redact_without_key_returns_503(monkeypatch):
+    monkeypatch.delenv("REDACTION_KEY", raising=False)
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={
+            "device_type": "temp_sensor",
+            "version": "1.0.0",
+            "hex": "aa10eb008936",
+            "fields": ["flags"],
+        },
+    )
+    assert resp.status_code == 503
+    assert "REDACTION_KEY" in resp.json()["detail"]
+
+
+def test_redact_uses_latest_active_version_when_omitted(monkeypatch):
+    monkeypatch.setenv("REDACTION_KEY", REDACT_KEY)
+    body = bytes([0xAA, 0x10, 0xEB, 0x00])
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={
+            "device_type": "temp_sensor",
+            "hex": make_message(body),
+            "fields": ["header"],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["version"] == "1.0.0"
