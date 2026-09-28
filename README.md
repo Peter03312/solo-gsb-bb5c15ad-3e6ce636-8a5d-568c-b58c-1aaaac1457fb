@@ -1,6 +1,6 @@
 # 工业二进制报文解析 API
 
-基于 FastAPI 的工业二进制报文解析服务。用户注册**带版本的报文定义**（位宽、端序、条件分支、计数驱动的重复字段、校验字段），提交指定版本的十六进制报文后，服务按位解析、验证校验和，并返回字段值、位偏移及实际分支路径；反向地，也可以提交字段值**编码**出十六进制报文（校验和自动计算写入）。对于串口/TCP 式的**分块字节流**，还可以提交十六进制分块数组，由同步头与长度字段自动分帧、跨块重组、剔除噪声并逐帧解析。此外支持保存**解析回归样例**：把报文与基线字段快照存入 SQLite，版本升级后对新版本重跑并逐字段比对差异。需要快速掌握一批报文的字段画像时，可用**批量报文统计画像**接口一次提交 1～500 条报文，按版本给出接收/拒绝情况与各字段的出现次数、最小/最大/均值。服务还内置**请求耗时追踪**：除 `/health` 外的每个 API 请求都会把 request_id、方法、路径、状态码、起止时间与耗时写入 SQLite，可通过可观测性接口按时间范围和路径前缀查询总数、错误数、p50/p95 耗时及按状态码分组统计。SQLite 持久化，启动时自动建表。
+基于 FastAPI 的工业二进制报文解析服务。用户注册**带版本的报文定义**（位宽、端序、条件分支、计数驱动的重复字段、校验字段），提交指定版本的十六进制报文后，服务按位解析、验证校验和，并返回字段值、位偏移及实际分支路径；反向地，也可以提交字段值**编码**出十六进制报文（校验和自动计算写入）。对于串口/TCP 式的**分块字节流**，还可以提交十六进制分块数组，由同步头与长度字段自动分帧、跨块重组、剔除噪声并逐帧解析。此外支持保存**解析回归样例**：把报文与基线字段快照存入 SQLite，版本升级后对新版本重跑并逐字段比对差异。需要快速掌握一批报文的字段画像时，可用**批量报文统计画像**接口一次提交 1～500 条报文，按版本给出接收/拒绝情况与各字段的出现次数、最小/最大/均值。还可以用**字段脱敏**接口对报文里的 uint/int 字段按 `REDACTION_KEY` 生成确定性的 HMAC-SHA256 位流原位替换，保持分支与报文长度、重算校验并返回可再次解析的 hex。服务还内置**请求耗时追踪**：除 `/health` 外的每个 API 请求都会把 request_id、方法、路径、状态码、起止时间与耗时写入 SQLite，可通过可观测性接口按时间范围和路径前缀查询总数、错误数、p50/p95 耗时及按状态码分组统计。SQLite 持久化，启动时自动建表。
 
 ## 快速启动
 
@@ -20,8 +20,15 @@ docker compose up --build
 | 变量      | 默认值             | 说明                 |
 | --------- | ------------------ | -------------------- |
 | `DB_PATH` | `/data/parser.db`  | SQLite 数据库文件路径（容器内），已挂载 named volume `parser-data` 持久化 |
+| `REDACTION_KEY` | `change-me-redaction-key` | `/api/v1/messages/redact` 脱敏接口使用的 HMAC-SHA256 密钥；同一密钥与同一输入永远产生相同的脱敏结果。生产环境务必改为随机强密钥；该变量未设置或为空时脱敏接口返回 503（其他接口不受影响） |
 
 端口映射在 `docker-compose.yml` 中为 `8000:8000`，如需修改主机端口，改左侧即可（如 `"9000:8000"`）。
+
+在主机上自定义脱敏密钥（不写死在 compose 文件里）：
+
+```bash
+REDACTION_KEY="$(openssl rand -hex 32)" docker compose up --build
+```
 
 ## 报文定义格式
 
@@ -83,6 +90,7 @@ docker compose up --build
 | POST | `/api/v1/stream/parse` | 字节流分帧：按同步头 + 无符号长度字段从十六进制分块中重组并逐帧解析；支持 `version_mode=detect` 在同一批分块中自动识别混合固件版本 |
 | POST | `/api/v1/detect` | 不传版本，用全部已注册版本（含停用）逐一解析以自动识别版本 |
 | POST | `/api/v1/messages/profile` | 批量报文统计画像：一次提交 1～500 条报文（每条可带/不带 `version`），按版本给出 accepted/rejected 与各字段出现次数及数值 min/max/mean |
+| POST | `/api/v1/messages/redact` | 字段脱敏：用 `REDACTION_KEY` 对所选 uint/int 字段按 HMAC-SHA256 位流原位替换，保持分支与报文长度并重算校验，返回可再次解析的 hex |
 | POST | `/api/v1/encode` | 反向编码：由字段值生成报文（版本选择规则同 parse） |
 | POST | `/api/v1/fixtures` | 保存带名称的解析回归样例（名称在**设备类型内**唯一，重复返回 409） |
 | GET  | `/api/v1/fixtures` | 列出回归样例，参数：`device_type` |
@@ -801,7 +809,70 @@ curl -s -o /dev/null -w "%{http_code}\n" -X POST \
 
 > 注意区分两种 `404`：路径完全未注册时 FastAPI 返回 `{"detail":"Not Found"}`；本路由在线但 `device_type` 下没有任何已注册版本（含停用）时返回 `{"detail":"no definitions found for device type '...'"}`。正常使用流程是先 `POST /api/v1/definitions` 注册至少一个版本，再批量提交样本，此时返回 `200`。
 
-### 11. 请求耗时追踪（/observability/latency）
+### 11. 报文脱敏（/messages/redact）
+
+对已解析报文里的敏感数值字段做**确定性原位脱敏**：选中的每个 `uint`/`int` 出现项，其原始位值被替换为基于环境变量 `REDACTION_KEY` 生成的 **HMAC-SHA256 位流**（截取到字段位宽）。同一密钥、同一报文、同一字段选择，永远得到同一份脱敏 hex；不依赖随机数，可离线复算、可重放比对。
+
+**请求体**：`device_type`、可选 `version`（缺省取最新启用版本，规则与 `/parse` 一致）、`hex` 与 `fields`（字段名列表，至少 1 个；重复名称自动去重；多余字段返回 422）。
+
+```bash
+# 对第 1、2 节注册的 temp_sensor 1.0.0 温度分支报文脱敏 temperature
+curl -X POST http://localhost:8000/api/v1/messages/redact \
+  -H 'Content-Type: application/json' \
+  -d '{"device_type": "temp_sensor", "version": "1.0.0",
+       "hex": "aa10eb008936", "fields": ["temperature"]}'
+```
+
+响应（节选）：
+
+```json
+{
+  "device_type": "temp_sensor",
+  "version": "1.0.0",
+  "hex": "aa104a8fc71e",
+  "fields": [ "...对脱敏后 hex 再次解析的完整字段结果（同 /parse）..." ],
+  "branch_path": [ "...与原报文完全相同的分支路径..." ],
+  "checksum": {"field": "crc", "algorithm": "crc16-ccitt", "valid": true,
+               "calculated_hex": "0xc71e"},
+  "message_bits": 48, "consumed_bits": 48, "trailing_bits": 0,
+  "redacted_fields": [
+    {"name": "temperature", "index": null, "bit_offset": 16, "bit_length": 16,
+     "original_raw_value": 235, "raw_value": -28854}
+  ]
+}
+```
+
+> 上例使用 `docker-compose.yml` 里的默认密钥 `change-me-redaction-key`；更换 `REDACTION_KEY` 后输出会随之改变（同一密钥下始终可复现）。生产环境请务必改用强随机密钥。
+
+**脱敏算法（确定性，可独立复算）**
+
+每个被选中的出现项（标量字段 1 项；repeat 字段按展开下标逐元素）独立计算，消息内容唯一标识「哪个字段、第几个重复项、原值是多少」：
+
+```
+message = <字段名 UTF-8> \x00 <重复项下标 ASCII，标量为空串> \x00 <原值的有符号十进制 ASCII>
+block0  = HMAC_SHA256(key=REDACTION_KEY, message)
+stream  = block0 || HMAC(key, block0) || HMAC(key, block1) || ...   # 仅位宽 > 256 时才需要续块
+新位值  = stream 的前 bit_length 位（MSB 优先）
+```
+
+- 位宽不超过 256 位（即全部常规字段）时，新位值就是普通 `HMAC-SHA256` 摘要的前 `bit_length` 位；更宽字段以反馈链式扩展，首块仍与普通 HMAC 完全一致。
+- 新位值按字段原有的大小端规则**原位写入**（支持 4 位等非字节对齐字段、小端字段、有符号 `int` 字段）；`redacted_fields[]` 给出每项的 `bit_offset`、`original_raw_value` 与替换后的 `raw_value`（`int` 字段按补码解释为有符号数），便于审计。
+- 全部替换位都由**原始解析结果**计算，因此处理顺序与重复字段名不影响输出；不同原值、不同重复项下标消息不同，不会因同字段碰撞（原值恰好相同才会得到相同脱敏值——这是「同密钥同输入同结果」的预期语义）。
+
+**保护字段与 422 规则**
+
+- 只允许选择 `uint`/`int` 字段；`bool`/`hex`/`ascii` 字段一律拒绝。
+- **条件引用字段**（被任何 `condition.field` 引用）、**repeat 计数字段**（被任何 `repeat.field` 引用）和**校验字段**不得脱敏——改写它们会改变分支走向或数组长度。
+- 未知字段、以及**在本报文中未出现**的字段（条件未命中被跳过、或 repeat 计数为 0 的空数组）返回 422；多个问题在 `detail.problems[]` 中一次性列出。
+- 输入必须**完整匹配定义**：定义完整消费报文（`trailing_bits = 0`）且**原始校验有效**（校验字段被分支跳过或校验不符均 422）；hex 非法/过短同样 422。
+
+**输出保证**
+
+- 脱敏只动所选字段的位与校验字段，**分支路径、repeat 展开长度与报文总位数保持不变**；随后按同样的校验算法对补丁后的字节**重算校验**并写回。
+- 返回前服务会对新 hex 再解析一次自检：完整消费、分支一致、校验通过，因此响应里的 `hex` 可以直接再次提交给 `/parse`（或再次脱敏）。未配置校验字段的定义则只保证完整消费与可再次解析。
+- `REDACTION_KEY` 未设置或为空字符串时，该接口返回 **503**（`detail` 提示配置缺失），其他接口不受影响。
+
+### 12. 请求耗时追踪（/observability/latency）
 
 服务内置请求耗时追踪中间件：**除 `/health` 外的每个 HTTP 请求**（含 4xx/5xx、路由未命中的 404）都会在响应完成后写入一条记录到 SQLite 表 `request_latency`，字段为：
 
@@ -891,6 +962,7 @@ app/
   analyzer.py   # 版本兼容性分析（条件等价类划分、可达分支枚举、布局比对；遇 repeat 拒绝分析）
   fixtures.py   # 回归样例：基线快照捕获、expect 断言、逐字段 added/removed/changed 比较
   profiler.py   # 批量报文统计画像（按版本隔离、字段出现次数、标量/重复元素 min/max/mean）
+  redaction.py  # HMAC-SHA256 确定性字段脱敏（字段名+下标+原值生成位流、原位替换、重算校验、再解析自检）
   observability.py # 请求耗时追踪中间件 + GET /api/v1/observability/latency 聚合统计
   checksum.py   # sum8 / xor8 / crc16-ccitt / crc16-modbus
   database.py   # SQLite 持久化（definitions / fixtures / request_latency 三表，启动自动建表）

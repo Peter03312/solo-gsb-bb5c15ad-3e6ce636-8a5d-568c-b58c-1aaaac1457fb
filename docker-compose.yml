@@ -7,6 +7,10 @@ services:
     environment:
       # SQLite file location inside the container (persisted via volume)
       DB_PATH: /data/parser.db
+      # HMAC-SHA256 key used by POST /api/v1/messages/redact. The same key and
+      # the same input always produce the same redacted bits. Change this for
+      # real deployments; redaction requests return 503 while it is unset.
+      REDACTION_KEY: change-me-redaction-key
     volumes:
       - parser-data:/data
     restart: unless-stopped

@@ -1,5 +1,6 @@
 """Industrial binary message parsing API."""
 
+import os
 import re
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -11,6 +12,7 @@ from .analyzer import CompatibilityError, analyze_compatibility
 from .encoder import EncodeError, encode_message
 from .fixtures import capture_snapshot, compare_snapshots, verify_expectation
 from .observability import LatencyTrackingMiddleware, router as observability_router
+from .redaction import RedactionError, redact_message
 from .framing import (
     MAX_BUFFER_SIZE,
     MAX_FRAME_SIZE,
@@ -32,39 +34,43 @@ from .schemas import (
     FixtureCreate,
     FixtureRunRequest,
     MessageProfileRequest,
+    MessageRedactRequest,
     ParseRequest,
     StreamParseRequest,
     validate_definition,
 )
 
 
-# Route served by the batch profiling processor (app/profiler.py). It is
-# registered as an ordinary @app.post below; ``_ensure_profiler_route`` runs at
-# application startup so that, if the handler is ever not wired onto the app,
-# the service fails loudly at boot instead of answering a silent 404 after
-# startup.
-BATCH_PROFILE_ROUTE = ("POST", "/api/v1/messages/profile")
+# Routes served by feature processors loaded with the application module.
+# ``_ensure_required_routes`` runs at application startup so that, if a handler
+# is ever not wired onto the app, the service fails loudly at boot instead of
+# answering a silent 404 after startup.
+REQUIRED_ROUTES = (
+    ("POST", "/api/v1/messages/profile"),
+    ("POST", "/api/v1/messages/redact"),
+)
 
 
-def _ensure_profiler_route() -> None:
-    for route in app.routes:
-        path = getattr(route, "path", None)
-        methods = getattr(route, "methods", None)
-        if path == BATCH_PROFILE_ROUTE[1] and methods and BATCH_PROFILE_ROUTE[0] in methods:
-            return
-    raise RuntimeError(
-        f"batch profiler route {BATCH_PROFILE_ROUTE[0]} {BATCH_PROFILE_ROUTE[1]} "
-        "is not registered: the batch profiling processor did not load with the "
-        "application"
-    )
+def _ensure_required_routes() -> None:
+    paths = {
+        getattr(route, "path", None): getattr(route, "methods", None)
+        for route in app.routes
+    }
+    for method, path in REQUIRED_ROUTES:
+        methods = paths.get(path)
+        if not methods or method not in methods:
+            raise RuntimeError(
+                f"route {method} {path} is not registered: its processor did "
+                "not load with the application"
+            )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     database.init_db()
-    # Confirm the batch profiling handler shipped with the running app before
-    # the service starts accepting traffic.
-    _ensure_profiler_route()
+    # Confirm the feature handlers shipped with the running app before the
+    # service starts accepting traffic.
+    _ensure_required_routes()
     yield
 
 
@@ -516,6 +522,52 @@ def messages_profile(req: MessageProfileRequest):
         "rejected_count": rejected_total,
         "rejected": top_rejected,
         "versions": groups,
+    }
+
+
+@app.post("/api/v1/messages/redact")
+def messages_redact(req: MessageRedactRequest):
+    """Redact selected uint/int fields of a message in place.
+
+    The message must fully match the selected definition (complete
+    consumption plus a valid original checksum). Each selected occurrence is
+    replaced with an HMAC-SHA256 bit stream derived from the configured
+    ``REDACTION_KEY`` over the field name, repeat index and original raw
+    value, truncated to the field's bit width -- so identical key and input
+    always yield identical output. Only uint/int fields are selectable;
+    fields referenced by conditions, repeat-counter fields and checksum
+    fields are protected, and unknown or branch-absent fields reject the
+    request with 422. Branch path and message length stay unchanged; the
+    checksum is recomputed over the patched bytes and the returned hex is
+    verified to parse again under the same definition.
+    """
+    key = os.environ.get("REDACTION_KEY")
+    if not key:
+        raise HTTPException(
+            status_code=503,
+            detail="redaction is not configured: the REDACTION_KEY environment variable is unset",
+        )
+
+    record = _select_definition(req.device_type, req.version)
+    data = _decode_hex(req.hex)
+
+    try:
+        result = redact_message(record, data, req.fields, key.encode("utf-8"))
+    except ParseError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except RedactionError as exc:
+        if exc.problems:
+            raise HTTPException(
+                status_code=422,
+                detail={"message": str(exc), "problems": exc.problems},
+            )
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return {
+        "device_type": record["device_type"],
+        "version": record["version"],
+        "definition_active": record["active"],
+        **result,
     }
 
 

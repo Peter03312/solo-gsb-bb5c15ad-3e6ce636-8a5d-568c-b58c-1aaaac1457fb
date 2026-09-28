@@ -3,6 +3,11 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 
 os.environ["DB_PATH"] = os.path.join(tempfile.mkdtemp(prefix="parser-test-"), "test.db")
+os.environ.setdefault("REDACTION_KEY", "unit-test-redaction-key")
+_REDACTION_KEY = os.environ["REDACTION_KEY"].encode("utf-8")
+
+import hashlib
+import hmac
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -129,7 +134,7 @@ def test_parse_humidity_branch():
     body = bytes([0xAA, 0x20, 0x55])
     resp = client.post(
         "/api/v1/parse",
-        json={"device_type": "temp_sensor", "hex": make_message(body)},
+        json={"device_type": "temp_sensor", "version": "1.0.0", "hex": make_message(body)},
     )
     assert resp.status_code == 200, resp.text
     data = resp.json()
@@ -146,7 +151,7 @@ def test_parse_checksum_mismatch():
     bad = good[:-2] + ("00" if good[-2:] != "00" else "ff")
     resp = client.post(
         "/api/v1/parse",
-        json={"device_type": "temp_sensor", "hex": bad},
+        json={"device_type": "temp_sensor", "version": "1.0.0", "hex": bad},
     )
     assert resp.status_code == 200
     assert resp.json()["checksum"]["valid"] is False
@@ -155,7 +160,7 @@ def test_parse_checksum_mismatch():
 def test_parse_truncated_message():
     resp = client.post(
         "/api/v1/parse",
-        json={"device_type": "temp_sensor", "hex": "AA10"},
+        json={"device_type": "temp_sensor", "version": "1.0.0", "hex": "AA10"},
     )
     assert resp.status_code == 422
 
@@ -163,7 +168,7 @@ def test_parse_truncated_message():
 def test_parse_invalid_hex():
     resp = client.post(
         "/api/v1/parse",
-        json={"device_type": "temp_sensor", "hex": "zzzz"},
+        json={"device_type": "temp_sensor", "version": "1.0.0", "hex": "zzzz"},
     )
     assert resp.status_code == 422
 
@@ -181,7 +186,7 @@ def test_trailing_bits_warning():
     msg = make_message(body) + "FF"  # extra byte beyond definition
     resp = client.post(
         "/api/v1/parse",
-        json={"device_type": "temp_sensor", "hex": msg},
+        json={"device_type": "temp_sensor", "version": "1.0.0", "hex": msg},
     )
     assert resp.status_code == 200
     data = resp.json()
@@ -324,7 +329,7 @@ def test_encode_negative_temperature_two_complement():
     # raw = -50 -> two's complement 0xFFCE, little-endian -> CE FF
     assert data["hex"] == make_message(bytes([0xAA, 0x10, 0xCE, 0xFF]))
     resp = client.post(
-        "/api/v1/parse", json={"device_type": "temp_sensor", "hex": data["hex"]}
+        "/api/v1/parse", json={"device_type": "temp_sensor", "version": "1.0.0", "hex": data["hex"]}
     )
     fields = {f["name"]: f for f in resp.json()["fields"]}
     assert fields["temperature"]["value"] == -5.0
@@ -3312,3 +3317,308 @@ def test_parse_ts_accepts_z_and_naive_as_utc():
     assert parse_ts("2030-01-01T00:00:00", "start") == datetime(
         2030, 1, 1, tzinfo=timezone.utc
     )
+
+
+# ------------------------------------------------------------------ redaction --
+
+
+def _redact_hmac_bits(name, index, raw, nbits, signed=False):
+    """Expected leading nbits of the redaction HMAC stream for one occurrence."""
+    index_part = b"" if index is None else str(index).encode("ascii")
+    message = name.encode() + b"\x00" + index_part + b"\x00" + str(raw).encode()
+    stream = hmac.new(_REDACTION_KEY, message, hashlib.sha256).digest()
+    bits = int.from_bytes(stream, "big") >> (256 - nbits)
+    if signed and bits >= 1 << (nbits - 1):
+        bits -= 1 << nbits
+    return bits
+
+
+def test_redact_temperature_branch_in_place_and_reparseable():
+    body = bytes([0xAA, 0x10, 0xEB, 0x00])
+    original = make_message(body)
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={"device_type": "temp_sensor", "version": "1.0.0",
+              "hex": original, "fields": ["temperature"]},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    # Length, header/control bytes and the branch path stay identical.
+    assert len(data["hex"]) == len(original)
+    assert data["hex"][0:4] == "aa10"
+    assert data["message_bits"] == 48
+    branch = {b["field"]: b for b in data["branch_path"]}
+    assert branch["temperature"]["matched"] is True
+    assert branch["humidity"]["matched"] is False
+
+    rf = data["redacted_fields"]
+    assert len(rf) == 1
+    entry = rf[0]
+    assert entry["name"] == "temperature"
+    assert entry["index"] is None
+    assert entry["bit_offset"] == 16
+    assert entry["bit_length"] == 16
+    assert entry["original_raw_value"] == 235
+    expected_raw = _redact_hmac_bits("temperature", None, 235, 16, signed=True)
+    assert entry["raw_value"] == expected_raw
+
+    # Checksum recomputed and the output parses again with a valid checksum.
+    assert data["checksum"]["valid"] is True
+    reparsed = client.post(
+        "/api/v1/parse",
+        json={"device_type": "temp_sensor", "version": "1.0.0", "hex": data["hex"]},
+    ).json()
+    assert reparsed["checksum"]["valid"] is True
+    assert reparsed["trailing_bits"] == 0
+    fields = {f["name"]: f for f in reparsed["fields"]}
+    assert fields["temperature"]["raw_value"] == expected_raw
+    assert fields["header"]["value"] == 0xAA
+    assert fields["msg_type"]["value"] == 1
+
+
+def test_redact_is_deterministic_for_same_key_and_input():
+    body = bytes([0xAA, 0x10, 0xEB, 0x00])
+    original = make_message(body)
+    payload = {"device_type": "temp_sensor", "version": "1.0.0", "hex": original,
+               "fields": ["temperature"]}
+    first = client.post("/api/v1/messages/redact", json=payload).json()
+    second = client.post("/api/v1/messages/redact", json=payload).json()
+    assert first["hex"] == second["hex"]
+    assert first["redacted_fields"] == second["redacted_fields"]
+
+
+def test_redact_multiple_fields_including_nibble_aligned():
+    # A definition with two adjacent 4-bit numeric fields and sum8 checksum.
+    payload = {
+        "device_type": "redact_redact_nibble_dev",
+        "version": "1.0.0",
+        "fields": [
+            {"name": "a", "type": "uint", "bit_length": 4},
+            {"name": "b", "type": "uint", "bit_length": 4},
+            {"name": "c", "type": "uint", "bit_length": 8},
+        ],
+        "checksum": {"field": "c", "algorithm": "xor8"},
+    }
+    assert client.post("/api/v1/definitions", json=payload).status_code == 201
+    # a=0xA b=0xB, c = xor8(0xAB) = 0xAB -> hex "abab"
+    assert xor8(bytes([0xAB])) == 0xAB
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={"device_type": "redact_redact_nibble_dev", "hex": "abab", "fields": ["a", "b"]},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert len(data["hex"]) == 4
+    # neither redacted nibble leaks the original 0xA/0xB pair byte header...
+    out = bytes.fromhex(data["hex"])
+    assert data["checksum"]["valid"] is True
+    # reparse and cross-check values
+    reparsed = client.post(
+        "/api/v1/parse",
+        json={"device_type": "redact_redact_nibble_dev", "hex": data["hex"]},
+    ).json()
+    values = {f["name"]: f["raw_value"] for f in reparsed["fields"]}
+    assert values["a"] == _redact_hmac_bits("a", None, 0xA, 4)
+    assert values["b"] == _redact_hmac_bits("b", None, 0xB, 4)
+    assert values["c"] == xor8(out[:1])
+
+
+def test_redact_repeated_field_uses_repeat_index_and_original_value():
+    samples = [23.2, 200.0, 1000.0]  # raws 232, 2000, 10000
+    original = _repeat_hex(samples)
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={"device_type": "array_dev", "version": "1.0.0", "hex": original, "fields": ["samples"]},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert len(data["hex"]) == len(original)
+    entries = data["redacted_fields"]
+    assert [e["index"] for e in entries] == [0, 1, 2]
+    assert [e["bit_offset"] for e in entries] == [16, 32, 48]
+    for index, raw in enumerate([232, 2000, 10000]):
+        assert entries[index]["name"] == "samples"
+        assert entries[index]["original_raw_value"] == raw
+        assert entries[index]["raw_value"] == _redact_hmac_bits(
+            "samples", index, raw, 16
+        )
+    # count/crc/header bytes preserved (aa03 ....), checksum revalidates
+    assert data["hex"][0:4] == "aa03"
+    assert data["checksum"]["valid"] is True
+    reparsed = client.post(
+        "/api/v1/parse",
+        json={"device_type": "array_dev", "version": "1.0.0", "hex": data["hex"]},
+    ).json()
+    assert reparsed["checksum"]["valid"] is True
+    fields = {f["name"]: f for f in reparsed["fields"]}
+    assert fields["count"]["value"] == 3
+    assert fields["samples"]["raw_value"] == [e["raw_value"] for e in entries]
+
+    # redacting again is a fixed point on the bit patterns (keyed on the new
+    # raw values) but stays deterministic and parseable
+    again = client.post(
+        "/api/v1/messages/redact",
+        json={"device_type": "array_dev", "version": "1.0.0", "hex": data["hex"], "fields": ["samples"]},
+    ).json()
+    again2 = client.post(
+        "/api/v1/messages/redact",
+        json={"device_type": "array_dev", "version": "1.0.0", "hex": data["hex"], "fields": ["samples"]},
+    ).json()
+    assert again["hex"] == again2["hex"]
+    assert again["checksum"]["valid"] is True
+
+
+def test_redact_counter_and_condition_and_checksum_fields_rejected():
+    body = bytes([0xAA, 0x10, 0xEB, 0x00])
+    original = make_message(body)
+    # several problems reported in one round trip
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={"device_type": "temp_sensor", "version": "1.0.0", "hex": original,
+              "fields": ["msg_type", "crc", "flags"]},
+    )
+    assert resp.status_code == 422
+    problems = resp.json()["detail"]["problems"]
+    joined = " ".join(problems)
+    assert "referenced by a condition" in joined
+    assert "checksum field cannot be redacted" in joined
+
+    # repeat counter is protected too
+    rep_resp = client.post(
+        "/api/v1/messages/redact",
+        json={"device_type": "array_dev", "version": "1.0.0", "hex": _repeat_hex([1.0]),
+              "fields": ["count"]},
+    )
+    assert rep_resp.status_code == 422
+    assert "drives a repeat count" in rep_resp.json()["detail"]["problems"][0]
+
+
+def test_redact_non_numeric_and_unknown_and_absent_fields_422():
+    body = bytes([0xAA, 0x10, 0xEB, 0x00])
+    original = make_message(body)
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={"device_type": "temp_sensor", "version": "1.0.0", "hex": original,
+              "fields": ["ghost", "humidity"]},
+    )
+    assert resp.status_code == 422
+    problems = resp.json()["detail"]["problems"]
+    assert any("unknown field 'ghost'" in p for p in problems)
+    assert any("not present in this message" in p and "humidity" in p for p in problems)
+
+    # bool/hex/ascii are not selectable
+    mixed = {
+        "device_type": "redact_mixed",
+        "version": "1.0.0",
+        "fields": [
+            {"name": "x", "type": "bool", "bit_length": 1},
+            {"name": "y", "type": "hex", "bit_length": 8},
+            {"name": "z", "type": "ascii", "bit_length": 16},
+            {"name": "pad", "type": "uint", "bit_length": 7},
+        ],
+    }
+    assert client.post("/api/v1/definitions", json=mixed).status_code == 201
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={"device_type": "redact_mixed", "hex": "ff414200",
+              "fields": ["x", "y", "z"]},
+    )
+    assert resp.status_code == 422
+    problems = resp.json()["detail"]["problems"]
+    assert len(problems) == 3
+    assert all("only uint/int fields can be redacted" in p for p in problems)
+
+
+def test_redact_zero_count_repeat_field_is_absent_422():
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={"device_type": "array_dev", "version": "1.0.0", "hex": _repeat_hex([]),
+              "fields": ["samples"]},
+    )
+    assert resp.status_code == 422
+    assert "repeat count is 0" in resp.json()["detail"]["problems"][0]
+
+
+def test_redact_requires_valid_original_checksum_and_full_consumption():
+    body = bytes([0xAA, 0x10, 0xEB, 0x00])
+    good = make_message(body)
+    bad_crc = good[:-2] + ("00" if good[-2:] != "00" else "ff")
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={"device_type": "temp_sensor", "version": "1.0.0", "hex": bad_crc, "fields": ["temperature"]},
+    )
+    assert resp.status_code == 422
+    assert "checksum mismatch" in resp.json()["detail"]
+
+    # trailing bits: definition must fully match the message
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={"device_type": "temp_sensor", "version": "1.0.0", "hex": good + "ff", "fields": ["temperature"]},
+    )
+    assert resp.status_code == 422
+    assert "trailing bit" in resp.json()["detail"]
+
+
+def test_redact_invalid_hex_and_short_message_422():
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={"device_type": "temp_sensor", "version": "1.0.0", "hex": "zz", "fields": ["temperature"]},
+    )
+    assert resp.status_code == 422
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={"device_type": "temp_sensor", "version": "1.0.0", "hex": "aa", "fields": ["temperature"]},
+    )
+    assert resp.status_code == 422
+
+
+def test_redact_unknown_device_and_version_rules():
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={"device_type": "ghost", "hex": "aabb", "fields": ["x"]},
+    )
+    assert resp.status_code == 404
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={"device_type": "temp_sensor", "version": "9.9.9",
+              "hex": "aa10eb008936", "fields": ["temperature"]},
+    )
+    assert resp.status_code == 404
+
+
+def test_redact_duplicate_field_names_are_deduplicated():
+    body = bytes([0xAA, 0x10, 0xEB, 0x00])
+    original = make_message(body)
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={"device_type": "temp_sensor", "version": "1.0.0", "hex": original,
+              "fields": ["temperature", "temperature"]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(resp.json()["redacted_fields"]) == 1
+
+
+def test_redact_empty_fields_and_extra_body_fields_422():
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={"device_type": "temp_sensor", "version": "1.0.0", "hex": "aa10eb008936", "fields": []},
+    )
+    assert resp.status_code == 422
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={"device_type": "temp_sensor", "version": "1.0.0", "hex": "aa10eb008936",
+              "fields": ["temperature"], "unexpected": 1},
+    )
+    assert resp.status_code == 422
+
+
+def test_redact_without_key_returns_503(monkeypatch):
+    monkeypatch.delenv("REDACTION_KEY", raising=False)
+    resp = client.post(
+        "/api/v1/messages/redact",
+        json={"device_type": "temp_sensor", "version": "1.0.0", "hex": "aa10eb008936",
+              "fields": ["temperature"]},
+    )
+    assert resp.status_code == 503
+    assert "REDACTION_KEY" in resp.json()["detail"]

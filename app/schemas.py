@@ -180,6 +180,21 @@ class MessageProfileRequest(BaseModel):
     samples: List[MessageProfileSample] = Field(min_length=1, max_length=500)
 
 
+class MessageRedactRequest(BaseModel):
+    # Deterministic HMAC-SHA256 in-place redaction of selected numeric fields.
+    # The message must fully match the definition with a valid checksum; the
+    # returned hex keeps the same length and branch path and is re-parseable.
+    model_config = ConfigDict(extra="forbid")
+
+    device_type: str = Field(min_length=1, max_length=128)
+    version: Optional[str] = None  # omitted -> latest active version
+    hex: str = Field(min_length=2)
+    # Field names to redact; only uint/int occurrences eligible (no condition
+    # references, repeat counters or checksum fields). Duplicate names are
+    # de-duplicated. Unknown or absent fields reject the whole request.
+    fields: List[str] = Field(min_length=1)
+
+
 def validate_definition(defn: DefinitionCreate) -> None:
     """Cross-field semantic validation. Raises ValueError on problems."""
     if not defn.fields:
